@@ -1,0 +1,302 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+#На входе пользователь выбирает файл из интернет-магазина, построенный на битрикс
+#Обработчик собирает файлы с различными оплатами: онлайн, личный кабинет, эквайринг...
+#На выходе файл с заказами, рассчитаной оплатой и статусом оплаты.
+#Компилируемый код для pyinstaller
+
+# In[1]:
+
+import pandas as pd
+import PySimpleGUI as sg
+import os
+import sys
+import xlsxwriter
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings("ignore")
+
+# In[2]:
+
+sg.theme('DarkAmber')
+
+# In[3]: #Получаем от пользователя файл с заказами
+#*************************************************
+
+def choose_orders():
+    if len(sys.argv) == 1:
+        event, values = sg.Window('Выбери файл эксель',
+                        [[sg.Text('Файл из банка должен лежать в той же папке, где файл с заказами и начинаться на Reports...\nФайл из битрикса НЕнужно пересохранять')],
+                        [sg.In(), sg.FileBrowse()],
+                        [sg.Open(), sg.Cancel()]]).read(close=True)
+        fname = values[0]
+    else:
+        fname = sys.argv[1]
+
+    if not fname:
+        sg.popup("Cancel", "Не выбран файл")
+        raise SystemExit("Cancelling: no filename supplied")
+
+    if (fname[-4:] != 'xlsx') & (fname[-3:] != 'xls'):
+        sg.popup("Cancel", "Выбран не правильный файл")
+        raise SystemExit()
+
+    fname.replace("\\","\\\\")
+    return fname
+
+fname = choose_orders()
+print(fname)
+
+# In[4]: #Открываем файл с заказами
+#*************************************************
+
+def open_orders(fname):
+    try:
+        #df_orders = pd.read_excel(fname, dtype={'Телефон':str,'ID':str})
+        df_orders = pd.read_html(fname, header = 0, encoding = 'utf-8')
+    except:
+        sg.popup("Cancel", "Не могу открыть файл, проверь имя листа и колонки")
+        raise SystemExit()
+
+    return df_orders
+
+df_orders = open_orders(fname)
+
+# In[5]: #Заменяем путь к файлу заказами для дальнейшего поиска файлов с оплатами
+#***************************************************************
+
+def convert_path_name(path_orders):
+    path_orders = fname[::-1]
+    path_orders = path_orders[path_orders.find('/')::]
+    path_orders = path_orders[::-1]
+    return path_orders
+
+fname = convert_path_name(fname)
+
+# In[6]: #Причесываем данные с заказами
+#***************************************************************
+
+def convert_orders():
+    df_orders = df_orders[0]
+    df_orders['ID'] = df_orders['ID'].map(str)
+    df_orders['Сумма'] = df_orders['Сумма'].str.replace(' руб.','', regex=False)
+    df_orders['Сумма'] = df_orders['Сумма'].str.replace(chr(160),'', regex=False)
+    df_orders['Сумма'] = df_orders['Сумма'].map(float)
+    try:
+        df_orders = df_orders[(df_orders['Доставка разреш.'] == 'Да') & (df_orders['Отменен'] == 'Нет')]
+    except:
+        pass
+    df_orders['Доплата после холдирования'].fillna(0, inplace = True)
+    df_orders.loc[(df_orders['Доплата после холдирования'] >= -0.01) & (df_orders['Доплата после холдирования'] <= 0.01),'Доплата после холдирования'] = 0
+    return df_orders
+
+df_orders = convert_orders()
+
+# In[7]: #Считываем файлы с оплатами из папки, откуда грузили заказы
+#***************************************************************
+
+def open_pay(fname):
+    for dir, subdir, files in os.walk(fname):
+        for file in files:
+            if file[:7] == 'Reports':
+                df_pay = pd.read_excel(os.path.join(dir, file), usecols = {'Статус','Сумма','Номер заказа','Описание заказа'}, dtype={'Телефон':str})
+    
+    try:
+        df_pay = df_pay[(df_pay['Статус'] == 'Завершён')|((df_pay['Статус'] == 'Возврат')&(df_pay['Сумма'] > 1))]
+    except:
+        sg.popup("Не нашел файл Reports из Интернет-эквайринга")
+        raise SystemExit()
+
+    df_pay.loc[df_pay['Описание заказа'].str.find('\n')>0,'Описание заказа'] = df_pay[df_pay['Описание заказа'].str.find('\n')>0]['Описание заказа'].str.replace('\n','')
+    df_pay.loc[df_pay['Номер заказа'].map(len)<7,'Номер заказа'] = df_pay[df_pay['Номер заказа'].map(len)<7]['Описание заказа']
+    df_pay['ID'] = ''
+    df_pay['ID'] = df_pay['Номер заказа'].str[:6]
+    df_pay['ID'] = df_pay['ID'].str.replace('_','')
+    df_pay.loc[df_pay['Номер заказа'].str[6:7] == '-','ID'] = df_pay[df_pay['Номер заказа'].str[6:7] == '-']['Номер заказа']
+    df_pay = df_pay[df_pay['Сумма'] != 1]
+
+    df_pay = df_pay[['ID','Сумма']].groupby('ID').sum().reset_index()
+    df_pay.rename(columns = {'Сумма':'Сумма банка'}, inplace = True)
+    df_pay.loc[df_pay['ID'].map(len)>7,'ID'] = df_pay.loc[df_pay['ID'].map(len)>7]['ID'].str[:15]
+    df_pay.loc[df_pay['ID'].str.find('Ex')>0,'ID'] = df_pay.loc[df_pay['ID'].str.find('Ex')>0]['ID'].str[:14]
+
+    return df_pay
+
+
+df_pay = open_pay(fname)
+
+# In[8]: #Прикрепляяем файл с оплатами из файлов с отчетами
+#***************************************************************
+
+df_orders_ekv = df_orders.merge(df_pay, how = 'left', on = 'ID')
+
+
+# In[9]: #Прикрепляяем оплату через личный кабинет банка
+#***************************************************************
+
+df_pay.rename(columns = {'Сумма банка':'Сумма ЛК'}, inplace = True)
+df_orders_ekv = df_orders_ekv.merge(df_pay, how = 'left', left_on = 'Номер заказа', right_on = 'ID', suffixes = (None,'_y'))
+
+df_orders_ekv.drop('ID_y', axis = 1, inplace = True)
+#df_orders_ekv.rename(columns = {'ID_x':'ID'}, inplace = True)
+df_orders_ekv['Сумма банка'].fillna(0, inplace = True)
+df_orders_ekv['Сумма ЛК'].fillna(0, inplace = True)
+
+# In[10]: #Грузим все файлы с оплатами по СБП
+#***************************************************************
+
+def open_sbp():
+    path = "\\ДЕНЬГИ\\СБП"
+    df_sbp = pd.DataFrame(columns = {'ID','Данные оплаты','Сумма СБП'})
+
+    for dir, subdir, files in os.walk(path):
+        for file in files:
+            df_sbp_now = pd.read_csv(os.path.join(dir, file), encoding = "WINDOWS-1251", sep = ';' ,usecols = {'id заказа','Сумма','Данные оплаты'}, header =1)
+            df_sbp_now['ID'] = df_sbp_now['id заказа'].str[-6:]
+            df_sbp_now['ID'] = df_sbp_now['ID'].str.replace('_','')
+            df_sbp_now = df_sbp_now.groupby(['ID','Данные оплаты']).sum().reset_index()
+            df_sbp_now.rename(columns = {'Сумма':'Сумма СБП'}, inplace = True)
+            df_sbp = pd.concat([df_sbp,df_sbp_now], axis = 0)
+            df_sbp.drop_duplicates(inplace = True)
+            df_sbp = df_sbp.groupby('ID').sum().reset_index()
+
+    return df_sbp            
+
+df_sbp = open_sbp()
+
+df_orders_ekv = df_orders_ekv.merge(df_sbp, how = 'left', on = 'ID')
+
+df_orders_ekv['Сумма СБП'].fillna(0, inplace = True)
+
+
+# In[11]: #Грузим все файлы с оплатами по эквайрингу банка 1
+#***************************************************************
+
+def open_bank1(date_now):
+    path = "\\ДЕНЬГИ\\Эквайринг\\БАНК1"
+    df_bank = pd.DataFrame(columns = {'Дата операции','Сумма операции'})
+
+    for dir, subdir, files in os.walk(path):
+        for file in files:
+            df_bank_now = pd.read_excel(os.path.join(dir, file), usecols = {'Дата операции','Сумма операции'},  engine = 'openpyxl')
+            df_bank_now.dropna(inplace = True)
+            df_bank = pd.concat([df_bank,df_bank_now], axis = 0)
+
+    df_bank.rename(columns = {'Сумма операции':'Сумма ОнлайнБанка'}, inplace = True)
+    #if isinstance(df_bank['Дата операции'], datetime) == False:
+    #df_bank['Дата операции'] = pd.to_datetime(df_bank['Дата операции'].str[:10], format = '%d.%m.%Y')
+    df_bank = df_bank[(df_bank['Дата операции']>=date_now - timedelta(days=3)) & 
+                      (df_bank['Дата операции']<=date_now + timedelta(days=4))]   
+    
+    df_bank = df_bank[df_bank['Сумма ОнлайнБанка'] > 1]
+    
+    return df_bank
+
+date_now = datetime(int(df_orders['Дата доставки'][:1].values[0][-4:]),int(df_orders['Дата доставки'][:1].values[0][3:5]),int(df_orders['Дата доставки'][:1].values[0][:2]))
+
+df_bank = open_bank1(date_now)
+
+df_orders_ekv = df_orders_ekv.merge(df_bank[['Сумма ОнлайнБанка']].drop_duplicates(), how = 'left', left_on = 'Сумма', right_on = 'Сумма ОнлайнБанка')
+
+df_orders_ekv['Сумма ОнлайнБанка'].fillna(0, inplace = True)
+
+
+# In[12]: #Грузим все файлы с оплатами по эквайрингу банка 2
+#***************************************************************
+
+def open_bank2(date_now):
+    path = "\\ДЕНЬГИ\\Эквайринг\\БАНК2"
+    df_bank2 = pd.DataFrame(columns = {'Дата','Сумма'})
+
+    for dir, subdir, files in os.walk(path):
+        for file in files:
+            df_bank2_now = pd.read_excel(os.path.join(dir, file), header = 5, usecols = {'Дата','Сумма'}, engine = 'openpyxl')
+            df_bank2_now.dropna(inplace = True)
+            df_bank2 = pd.concat([df_bank2, df_bank2_now], axis = 0)
+
+    df_bank2.rename(columns = {'Сумма':'Сумма банка 2'}, inplace = True)
+    df_bank2['Дата'] = pd.to_datetime(df_bank2['Дата'], format = '%d/%m/%Y')
+    df_bank2 = df_bank2[(df_bank2['Дата']>=date_now - timedelta(days=3)) & 
+                    (df_bank2['Дата']<=date_now + timedelta(days=4))]   
+    
+    df_bank2 = df_bank2[df_bank2['Сумма банка 2'] > 1]
+    
+    return df_bank2
+
+df_bank2 = open_bank2(date_now)
+
+df_orders_ekv = df_orders_ekv.merge(df_bank2[['Сумма банка 2']].drop_duplicates(), how = 'left', left_on = 'Сумма', right_on = 'Сумма банка 2')
+
+df_orders_ekv['Сумма банка 2'].fillna(0, inplace = True)
+
+
+# In[13]: #Проверяем доплату
+#***************************************************************
+
+
+def find_add_pay():
+    for i in range(len(df_orders_ekv)):
+        if df_orders_ekv['Доплата после холдирования'][i] > 0:
+            if len(df_bank[df_bank['Сумма ОнлайнБанка'] == df_orders_ekv['Доплата после холдирования'][i]]) > 0:
+                df_orders_ekv.loc[i, 'Сумма ОнлайнБанка'] = df_orders_ekv['Доплата после холдирования'][i]
+            if len(df_bank2[df_bank2['Сумма банка 2'] == df_orders_ekv['Доплата после холдирования'][i]]) > 0:
+                df_orders_ekv.loc[i, 'Сумма банка 2'] = df_orders_ekv['Доплата после холдирования'][i]
+        if df_orders_ekv['Сумма ОнлайнБанка'][i] == 0:
+            if len(df_bank[(df_bank['Сумма ОнлайнБанка'] >= df_orders_ekv['Сумма'][i] - 0.01) & (df_bank['Сумма ОнлайнБанка'] <= df_orders_ekv['Сумма'][i] + 0.01)]) > 0:
+                df_orders_ekv.loc[i, 'Сумма ОнлайнБанка'] = df_orders_ekv['Сумма'][i]
+        if df_orders_ekv['Сумма банка 2'][i] == 0:
+            if len(df_bank2[(df_bank2['Сумма банка 2'] >= df_orders_ekv['Сумма'][i] - 0.01) & (df_bank2['Сумма банка 2'] <= df_orders_ekv['Сумма'][i] + 0.01)]) > 0:
+                df_orders_ekv.loc[i, 'Сумма банка 2'] = df_orders_ekv['Сумма'][i]
+
+
+find_add_pay()
+
+
+# In[14]: #Проверяем расхождения по оплатам
+#***************************************************************
+
+def solve_difference():
+    for i in range(len(df_orders_ekv)):
+        if (df_orders_ekv['Сумма банка'][i] == df_orders_ekv['Сумма ОнлайнБанка'][i]) | (df_orders_ekv['Сумма ЛК'][i] == df_orders_ekv['Сумма ОнлайнБанка'][i]):
+            df_orders_ekv.loc[i, 'Сумма расхождения'] = round(max(df_orders_ekv['Сумма банка'][i], df_orders_ekv['Сумма ОнлайнБанка'][i], df_orders_ekv['Сумма ЛК'][i]) + df_orders_ekv['Сумма банка 2'][i] + df_orders_ekv['Сумма СБП'][i] - df_orders_ekv['Сумма'][i], 2)
+        else:
+            df_orders_ekv.loc[i, 'Сумма расхождения'] = round(df_orders_ekv['Сумма банка'][i] + df_orders_ekv['Сумма ОнлайнБанка'][i] + df_orders_ekv['Сумма ЛК'][i] + df_orders_ekv['Сумма банка 2'][i] + df_orders_ekv['Сумма СБП'][i] - df_orders_ekv['Сумма'][i], 2)
+
+solve_difference()
+
+
+# In[15]: #Проставляем статус оплаты
+#***************************************************************
+
+def insert_status():
+    df_orders_ekv['Статус сверки'] = ''
+    list_pay_status = ['[20] Банковские карты','[20] Оплатить картой при получении','[20] Безналичная оплата в магазине','[20] Безналичная оплата сборщику']
+    #df_orders_ekv.loc[(df_orders_ekv['Платежная система'].isin(list_pay_status))|(df_orders_ekv['Платежная система'].str.contains('Безналичная оплата курьеру')),'Сумма расхождения'] = 0
+    df_orders_ekv.loc[df_orders_ekv['Сумма расхождения'] == 0, 'Статус сверки'] = 'Сходится'
+    df_orders_ekv.loc[df_orders_ekv['Сумма расхождения'] >= 0.01, 'Статус сверки'] = 'Что-то не так'
+    df_orders_ekv.loc[((df_orders_ekv['Платежная система'].isin(list_pay_status))|(df_orders_ekv['Платежная система'].str.contains('Безналичная оплата курьеру')))&(df_orders_ekv['Сумма расхождения']<=-0.01),'Статус сверки'] = 'Сверка с магазином'
+    #df_orders_ekv.loc[(~df_orders_ekv['Платежная система'].isin(list_pay_status))&(~df_orders_ekv['Платежная система'].str.contains('Безналичная оплата курьеру'))&(df_orders_ekv['Сумма расхождения']==0),'Статус сверки'] = 'Сходится'
+    df_orders_ekv.loc[(~df_orders_ekv['Платежная система'].isin(list_pay_status))&(~df_orders_ekv['Платежная система'].str.contains('Безналичная оплата курьеру'))&(df_orders_ekv['Сумма расхождения']!=0),'Статус сверки'] = 'Что-то не так'
+    df_orders_ekv.loc[(df_orders_ekv['Платежная система'].str.contains('Система быстрых платежей')) & (df_orders_ekv['Сумма СБП'] == 0),'Статус сверки'] = 'Не нашел платеж СБП'
+
+insert_status()
+
+
+
+# In[15]: #Сохраняем файл обратно
+#***************************************************************
+
+path_name = fname + df_orders['Дата доставки'][:1].values[0][-4:] + df_orders['Дата доставки'][:1].values[0][3:5] + df_orders['Дата доставки'][:1].values[0][:2] + " Заказы со статусом++.xlsx"
+
+writer = pd.ExcelWriter(path_name, engine = 'xlsxwriter')
+
+#в этой версии один лист, поэтому сохраняем в эксель напрямую
+#workbook = xlsxwriter.Workbook(path_name)
+#worksheet = workbook.add_worksheet()
+#worksheet.write('Заказы', df_orders_ekv)
+
+df_orders_ekv.to_excel(writer, sheet_name = 'Заказы', index = False)
+
+writer.save()
+writer.close()
